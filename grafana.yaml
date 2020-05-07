@@ -1,0 +1,161 @@
+---
+    kind: Template
+    apiVersion: v1
+    metadata:
+      name: grafana
+      annotations:
+        "openshift.io/display-name": Grafana
+        description: Custom Grafana instance with customer Prometheus Datasource
+        tags: "metrics,monitoring,grafana,prometheus"
+    parameters:
+    - description: The location of the grafana image
+      name: IMAGE_GRAFANA
+      value: grafana/grafana 
+    - description: The location of the proxy image
+      name: IMAGE_PROXY
+      value: openshift/oauth-proxy:latest
+    - description: External URL for the grafana route
+      name: ROUTE_URL
+      value: ""
+    - description: The namespace to instantiate under. Defaults to 'grafana'.
+      name: NAMESPACE
+      value: custom-monitoring
+    - description: The session secret for the proxy
+      name: SESSION_SECRET
+      generate: expression
+      from: "[a-zA-Z0-9]{43}"
+    objects:
+    - apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: grafana
+        namespace: "${NAMESPACE}"
+        annotations:
+          serviceaccounts.openshift.io/oauth-redirectreference.primary: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"grafana"}}'
+    - apiVersion: authorization.openshift.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: grafana-cluster-reader
+      roleRef:
+        name: cluster-reader
+      subjects:
+      - kind: ServiceAccount
+        name: grafana
+        namespace: "${NAMESPACE}"
+    - apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: grafana
+        namespace: "${NAMESPACE}"
+      spec:
+        host: "${ROUTE_URL}"
+        to:
+          name: grafana
+        tls:
+          termination: Reencrypt
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: grafana
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/scheme: https
+          service.alpha.openshift.io/serving-cert-secret-name: grafana-tls
+        namespace: "${NAMESPACE}"
+        labels:
+          metrics-infra: grafana
+          name: grafana
+      spec:
+        ports:
+        - name: grafana
+          port: 443
+          protocol: TCP
+          targetPort: 8443
+        selector:
+          app: grafana
+    - apiVersion: v1
+      kind: Secret
+      metadata:
+        name: grafana-proxy
+        namespace: "${NAMESPACE}"
+      stringData:
+        session_secret: "${SESSION_SECRET}="
+    # Deploy Grafana behind an oauth proxy
+    - apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        labels:
+          app: grafana
+        name: grafana
+        namespace: "${NAMESPACE}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: grafana
+        template:
+          metadata:
+            labels:
+              app: grafana
+            name: grafana
+          spec:
+            serviceAccountName: grafana
+            containers:
+            - name: oauth-proxy
+              image: ${IMAGE_PROXY}
+              imagePullPolicy: IfNotPresent
+              ports:
+              - containerPort: 8443
+                name: web
+              args:
+              - -https-address=:8443
+              - -http-address=
+              - -email-domain=*
+              - -client-id=system:serviceaccount:${NAMESPACE}:grafana
+              - -upstream=http://localhost:3000
+              - -provider=openshift
+    #          - '-openshift-delegate-urls={"/api/datasources": {"resource": "namespace", "verb": "get", "resourceName": "grafana", "namespace": "${NAMESPACE}"}}'
+              - '-openshift-sar={"namespace": "${NAMESPACE}", "verb": "list", "resource": "services"}'
+              - -tls-cert=/etc/tls/private/tls.crt
+              - -tls-key=/etc/tls/private/tls.key
+              - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+              - -cookie-secret-file=/etc/proxy/secrets/session_secret
+              - -skip-auth-regex=^/metrics,/api/datasources,/api/dashboards
+              volumeMounts:
+              - mountPath: /etc/tls/private
+                name: grafana-tls
+              - mountPath: /etc/proxy/secrets
+                name: secrets
+    
+            - name: grafana
+              image: ${IMAGE_GRAFANA}
+              ports:
+              - name: grafana-http
+                containerPort: 3000
+              volumeMounts:
+              - mountPath: "/root/go/src/github.com/grafana/grafana/data"
+                name: grafana-data
+              - mountPath: "/usr/share/grafana/conf"
+                name: grafanaconfig
+              - mountPath: /etc/tls/private
+                name: grafana-tls
+              - mountPath: /etc/proxy/secrets
+                name: secrets
+              - mountPath: /usr/share/grafana/datasources
+                name: customer-monitoring-grafana-datasource-volume
+            volumes:
+            - name: grafanaconfig
+              configMap:
+                name: grafana-config
+            - name: secrets
+              secret:
+                secretName: grafana-proxy
+            - name: grafana-tls
+              secret:
+                secretName: grafana-tls
+            - emptyDir: {}
+              name: grafana-data
+            - name: customer-monitoring-grafana-datasource-volume
+              secret:
+                defaultMode: 420
+                secretName: custom-monitoring-grafana-datasource
